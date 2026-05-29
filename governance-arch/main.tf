@@ -215,6 +215,69 @@ resource "aws_config_configuration_recorder_status" "main" {
   depends_on = [aws_config_delivery_channel.main]
 }
 
+# ─── SCP simulation — IAM deny policy for test user ─────────────────────────
+#
+# Mirrors the SCP in documentation/policies/scp-deny-untagged.json using an
+# IAM Deny policy, which produces the same UnauthorizedOperation error without
+# needing AWS Organizations.
+
+resource "aws_iam_user" "scp_test_user" {
+  name = "finops-scp-test-user"
+
+  tags = {
+    Name    = "finops-scp-test-user"
+    Purpose = "SCP simulation testing"
+  }
+}
+
+resource "aws_iam_access_key" "scp_test_user" {
+  user = aws_iam_user.scp_test_user.name
+}
+
+# Allow the test user to attempt EC2 launches (so the deny is what stops them)
+resource "aws_iam_user_policy_attachment" "scp_test_ec2_access" {
+  user       = aws_iam_user.scp_test_user.name
+  policy_arn = "arn:aws:iam::aws:policy/AmazonEC2FullAccess"
+}
+
+resource "aws_iam_policy" "deny_untagged_ec2" {
+  name        = "finops-deny-untagged-ec2"
+  description = "Simulates SCP: blocks ec2:RunInstances when CostCenter tag is absent or empty"
+
+  policy = jsonencode({
+    Version = "2012-10-17"
+    Statement = [
+      {
+        Sid    = "DenyRunInstancesMissingCostCenter"
+        Effect = "Deny"
+        Action = "ec2:RunInstances"
+        Resource = "arn:aws:ec2:*:*:instance/*"
+        Condition = {
+          Null = {
+            "aws:RequestTag/CostCenter" = "true"
+          }
+        }
+      },
+      {
+        Sid    = "DenyRunInstancesEmptyCostCenter"
+        Effect = "Deny"
+        Action = "ec2:RunInstances"
+        Resource = "arn:aws:ec2:*:*:instance/*"
+        Condition = {
+          StringEquals = {
+            "aws:RequestTag/CostCenter" = ""
+          }
+        }
+      }
+    ]
+  })
+}
+
+resource "aws_iam_user_policy_attachment" "scp_test_deny" {
+  user       = aws_iam_user.scp_test_user.name
+  policy_arn = aws_iam_policy.deny_untagged_ec2.arn
+}
+
 # ─── Tagging policy — require CostCenter on EC2 instances ────────────────────
 
 resource "aws_config_config_rule" "require_costcenter_tag" {

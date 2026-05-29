@@ -22,3 +22,19 @@ output "config_s3_bucket" {
   description = "S3 bucket storing AWS Config findings"
   value       = aws_s3_bucket.config_logs.bucket
 }
+
+output "scp_test_user_name" {
+  description = "IAM username for SCP simulation testing"
+  value       = aws_iam_user.scp_test_user.name
+}
+
+output "scp_test_user_access_key_id" {
+  description = "Access key ID for the SCP test user — use with AWS CLI"
+  value       = aws_iam_access_key.scp_test_user.id
+}
+
+output "scp_test_user_secret_access_key" {
+  description = "Secret access key for the SCP test user"
+  value       = aws_iam_access_key.scp_test_user.secret
+  sensitive   = true
+}
