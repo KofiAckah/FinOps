@@ -95,3 +95,5 @@ Thumbs.db
 # Exception: example.tfvars is safe to commit (no real secrets)
 !example.tfvars
 ansible.log
+review.md
+review.txt
