@@ -29,20 +29,23 @@ Zombie assets are AWS resources that are running but serving no purpose. They ar
 
 ### Automated cleanup — garbage collector script
 
-The `cleanup/` module in this project contains a Lambda function (`garbage_collector.py`) that runs every Sunday at 23:59 UTC via EventBridge. It does the following:
+The `modules/cleanup` module contains a Lambda function (`garbage_collector.py`) that runs every Sunday at 23:59 UTC via EventBridge and **sweeps every enabled region**. It does the following:
 
 ```
-1. Describe all EBS volumes where state = "available"  → delete them
-2. Describe all Elastic IPs where AssociationId is null → release them
-3. Describe all running EC2 instances
-   └── For each instance older than 7 days:
-       └── Pull CloudWatch CPUUtilization (7-day average)
-           └── If avg CPU < 5% → terminate the instance
+For each enabled region:
+  1. Describe all EBS volumes where state = "available"   → delete them
+  2. Describe all Elastic IPs where AssociationId is null → release them
+  3. Describe all running EC2 instances
+     └── If tagged Type=ZombieAsset AND older than 7 days:
+         └── Pull CloudWatch CPUUtilization (7-day average)
+             └── If avg CPU < 5% → terminate the instance
 ```
 
-**Deploy the cleanup Lambda:**
+Termination is fenced to instances tagged `Type=ZombieAsset` in **both** the code and the Lambda's IAM policy, so it can never terminate an untagged production instance.
+
+**Deploy** (single root for the whole project):
 ```bash
-cd cleanup
+./scripts/bootstrap-backend.sh   # once
 terraform init
 terraform apply
 ```
@@ -168,23 +171,22 @@ Scale-in has a longer cooldown (300s vs 120s) to prevent thrashing — you want 
 
 ### Deploy the optimized ASG
 
+The ASG is part of the single Terraform root, so it deploys with the rest of the project:
+
 ```bash
-cd optimize-arch
-terraform init
-terraform plan
 terraform apply
 ```
 
-**Verify the instance mix after deployment:**
+**Verify the instance mix after deployment** (query EC2 directly so the Spot lifecycle is visible):
 ```bash
-aws autoscaling describe-auto-scaling-groups \
-  --auto-scaling-group-names finops-mixed-instances-asg \
-  --region eu-west-1 \
-  --query 'AutoScalingGroups[0].Instances[*].{ID:InstanceId,Type:InstanceType,Lifecycle:LifecycleState,Market:InstancePurchaseOption}' \
+aws ec2 describe-instances --region eu-west-1 \
+  --filters Name=tag:aws:autoscaling:groupName,Values=finops-mixed-instances-asg \
+            Name=instance-state-name,Values=running \
+  --query 'Reservations[].Instances[].{ID:InstanceId,Type:InstanceType,Lifecycle:InstanceLifecycle}' \
   --output table
 ```
 
-You should see 1 instance with `on-demand` purchase option and 2 with `spot`.
+You should see 1 instance with `Lifecycle: None` (On-Demand base) and 2 with `Lifecycle: spot`.
 
 ---
 

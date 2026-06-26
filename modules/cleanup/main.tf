@@ -2,18 +2,13 @@ terraform {
   required_providers {
     aws = {
       source  = "hashicorp/aws"
-      version = "6.25.0"
+      version = ">= 6.0"
     }
     archive = {
       source  = "hashicorp/archive"
       version = "~> 2.0"
     }
   }
-  required_version = ">= 1.3.0"
-}
-
-provider "aws" {
-  region = var.region
 }
 
 # ─── Lambda package ──────────────────────────────────────────────────────────
@@ -46,8 +41,11 @@ resource "aws_iam_policy" "garbage_collector" {
   policy = jsonencode({
     Version = "2012-10-17"
     Statement = [
+      # Read-only discovery + deletion of resources that are unattached by
+      # definition (available volumes, unassociated EIPs). The "unattached"
+      # state is itself the safety signal — these carry no live workload.
       {
-        Sid    = "EC2ZombieCleanup"
+        Sid    = "DiscoverAndReleaseDetachedResources"
         Effect = "Allow"
         Action = [
           "ec2:DescribeVolumes",
@@ -55,14 +53,29 @@ resource "aws_iam_policy" "garbage_collector" {
           "ec2:DescribeAddresses",
           "ec2:ReleaseAddress",
           "ec2:DescribeInstances",
-          "ec2:TerminateInstances",
+          "ec2:DescribeRegions",
         ]
         Resource = "*"
       },
+      # Terminating a *running* instance is the highest blast-radius action,
+      # so it is fenced to instances explicitly tagged as disposable. Even if
+      # the function logic regressed, IAM cannot terminate a production
+      # instance that is not tagged Type=ZombieAsset.
       {
-        Sid    = "CloudWatchMetrics"
-        Effect = "Allow"
-        Action = ["cloudwatch:GetMetricStatistics"]
+        Sid      = "TerminateZombieInstancesOnly"
+        Effect   = "Allow"
+        Action   = "ec2:TerminateInstances"
+        Resource = "*"
+        Condition = {
+          StringEquals = {
+            "ec2:ResourceTag/Type" = "ZombieAsset"
+          }
+        }
+      },
+      {
+        Sid      = "CloudWatchMetrics"
+        Effect   = "Allow"
+        Action   = ["cloudwatch:GetMetricStatistics"]
         Resource = "*"
       },
       {
@@ -93,7 +106,7 @@ resource "aws_cloudwatch_log_group" "garbage_collector" {
 
 resource "aws_lambda_function" "garbage_collector" {
   function_name    = "zombie-garbage-collector"
-  description      = "Deletes unattached EBS volumes, unassociated EIPs, and idle EC2 instances"
+  description      = "Deletes unattached EBS volumes, unassociated EIPs, and idle zombie EC2 instances across all regions"
   role             = aws_iam_role.garbage_collector.arn
   filename         = data.archive_file.lambda_zip.output_path
   source_code_hash = data.archive_file.lambda_zip.output_base64sha256
@@ -105,6 +118,8 @@ resource "aws_lambda_function" "garbage_collector" {
     variables = {
       CPU_IDLE_THRESHOLD = var.cpu_idle_threshold
       IDLE_LOOKBACK_DAYS = var.idle_lookback_days
+      ZOMBIE_TAG_KEY     = var.zombie_tag_key
+      ZOMBIE_TAG_VALUE   = var.zombie_tag_value
     }
   }
 

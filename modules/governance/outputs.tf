@@ -28,13 +28,12 @@ output "scp_test_user_name" {
   value       = aws_iam_user.scp_test_user.name
 }
 
-output "scp_test_user_access_key_id" {
-  description = "Access key ID for the SCP test user — use with AWS CLI"
-  value       = aws_iam_access_key.scp_test_user.id
-}
-
-output "scp_test_user_secret_access_key" {
-  description = "Secret access key for the SCP test user"
-  value       = aws_iam_access_key.scp_test_user.secret
-  sensitive   = true
+# No access key is emitted by Terraform — that would persist the secret in
+# state. Create a short-lived key for the deny tests with the command below,
+# then delete it when finished:
+#
+#   aws iam delete-access-key --user-name finops-scp-test-user --access-key-id <id>
+output "scp_test_user_key_command" {
+  description = "Command to generate a temporary access key for the SCP test user"
+  value       = "aws iam create-access-key --user-name ${aws_iam_user.scp_test_user.name}"
 }

@@ -1,7 +1,8 @@
 
 # Local .terraform directories
 .terraform/
-.terraform.lock.hcl
+# NOTE: .terraform.lock.hcl is intentionally NOT ignored — it pins provider
+# versions and should be committed for reproducible CI/team builds.
 
 # .tfstate files
 *.tfstate
@@ -49,7 +50,6 @@ terraform.rc
 
 # Terraform state & cache
 .terraform/
-.terraform.lock.hcl
 terraform.tfstate
 terraform.tfstate.backup
 terraform.tfstate.*.backup
@@ -58,6 +58,16 @@ override.tf
 override.tf.json
 *_override.tf
 *_override.tf.json
+
+# Lambda build artifacts — archive_file regenerates these at plan time
+*.zip
+
+# Python
+__pycache__/
+*.pyc
+.pytest_cache/
+.venv/
+venv/
 
 # Sensitive files
 *.pem

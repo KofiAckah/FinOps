@@ -6,352 +6,234 @@
 
 ## Project Structure
 
+A **single Terraform root** composes four child modules behind **one S3 remote backend**. There is one `terraform init` / `terraform apply` for the whole project — Terraform resolves the deploy order from the dependency graph.
+
 ```
 FinOps/
-├── zombie-arch/                  # Part 1 — Wasteful resource simulation
-│   ├── main.tf
-│   ├── variables.tf
-│   └── outputs.tf
+├── backend.tf                    # S3 remote state + native lockfile (no DynamoDB)
+├── providers.tf                  # AWS + archive providers, default_tags
+├── main.tf                       # composes the four modules
+├── variables.tf / outputs.tf     # root inputs & surfaced outputs
+├── example.tfvars                # copy to terraform.tfvars
 │
-├── cleanup/                      # Part 1 — Automated garbage collector Lambda
-│   ├── main.tf
-│   ├── variables.tf
-│   ├── outputs.tf
-│   └── lambda/
-│       └── garbage_collector.py
+├── modules/
+│   ├── zombie/                   # Part 1 — wasteful resource simulation
+│   ├── cleanup/                  # Part 1 — multi-region garbage-collector Lambda
+│   │   └── lambda/garbage_collector.py
+│   ├── governance/               # Part 2 — budget, alerts, tagging policy
+│   │   └── documentation/policies/{scp-deny-untagged.json, tagging-policy.md}
+│   └── optimize/                 # Part 3 — Spot + On-Demand mixed ASG
+│       └── documentation/cost-optimization-guide.md
 │
-├── governance-arch/              # Part 2 — Budgets, alerts, tagging policy
-│   ├── main.tf
-│   ├── variables.tf
-│   ├── outputs.tf
-│   └── documentation/
-│       └── policies/
-│           ├── scp-deny-untagged.json
-│           └── tagging-policy.md
-│
-├── optimize-arch/                # Part 3 — Spot + On-Demand ASG
-│   ├── main.tf
-│   ├── variables.tf
-│   ├── outputs.tf
-│   └── documentation/
-│       └── cost-optimization-guide.md
-│
-└── Assets/                       # Screenshots from live AWS console
+├── tests/                        # pytest unit tests for the garbage collector
+├── scripts/bootstrap-backend.sh  # creates the S3 state bucket (run once)
+├── .github/workflows/ci.yml      # fmt + validate + pytest on every push/PR
+└── Assets/                       # screenshots from the live AWS console
 ```
+
+> **What changed from the first submission (73%, redo):** consolidated 4 separate Terraform roots with local state into one root + child modules on an S3 backend; scoped the Lambda's `TerminateInstances` to `Type=ZombieAsset`; made the garbage collector multi-region; removed duplicate budget emails; stopped writing the IAM secret key into state; added unit tests + CI; and `.gitignore`d the Lambda zip. See [Review Response](#how-the-first-round-feedback-was-addressed).
+
+---
+
+## Deploy
+
+```bash
+# 0. Authenticate (this account uses the NSPAccount profile)
+export AWS_PROFILE=NSPAccount
+
+# 1. Create the remote-state bucket once
+./scripts/bootstrap-backend.sh
+
+# 2. Provide your alert email
+cp example.tfvars terraform.tfvars
+$EDITOR terraform.tfvars        # set alert_email
+
+# 3. Init against the S3 backend, then apply everything
+terraform init
+terraform apply
+```
+
+After apply, **confirm the SNS subscription email** AWS sends to `alert_email`, or budget alerts will not be delivered.
+
+### Tear down
+
+```bash
+terraform destroy
+```
+
+> **Org constraint:** this sandbox sits under an AWS Organizations SCP that denies `config:StopConfigurationRecorder` and `config:DeleteConfigRule`. `terraform destroy` will therefore fail to remove `aws_config_configuration_recorder` and the `require-costcenter-tag-ec2` rule — leave them in place (an org admin owns them) or `terraform state rm` those two addresses before destroying the rest. This is why those resources survived the first teardown.
 
 ---
 
 ## Part 1 — Analysis and Cleanup
 
-### Zombie resources deployed
+### Zombie resources deployed (`modules/zombie`)
 
-Three deliberately wasteful resources were provisioned in `eu-west-1` using `zombie-arch/` to simulate a neglected account:
+Three deliberately wasteful resources are provisioned in `eu-west-1` to simulate a neglected account. All are tagged `Type=ZombieAsset` so the garbage collector is permitted to reap them.
 
 | Resource | Name | Details | Why it wastes money |
 |---|---|---|---|
-| EC2 Instance | `zombie-idle-ec2` | t3.medium, Amazon Linux 2023 | Running with 0% CPU — paying for idle compute |
-| EBS Volume | `zombie-unattached-ebs` | 10 GiB gp3, `eu-west-1a` | `Available` state — not attached to any instance |
-| Elastic IP | `zombie-unassociated-eip` | `79.125.119.62` | Allocated but not associated — AWS charges for idle EIPs |
-
----
+| EC2 Instance | `zombie-idle-ec2` | t3.medium, Amazon Linux 2023 | Running at 0% CPU — paying for idle compute |
+| EBS Volume | `zombie-unattached-ebs` | 10 GiB gp3, `eu-west-1a` | `Available` — not attached to any instance |
+| Elastic IP | `zombie-unassociated-eip` | allocated EIP | Not associated — AWS charges for idle EIPs |
 
 ### Evidence — AWS Console screenshots
 
 #### Cost before zombie resources
-
-At the start of the audit, the account spent only $0.03 for the month — driven by Config, Tax, S3, and GuardDuty. This is the baseline.
-
+Baseline monthly spend was **$0.03** (Config, Tax, S3, GuardDuty).
 ![Cost before zombie resources](Assets/Screenshot%20from%202026-05-26%2015-37-54.png)
 
----
-
 #### Trusted Advisor
-
-Trusted Advisor was checked for cost optimization findings. The account is on the free support tier, which limits access to the full check set — cost-specific checks for idle EC2 and EIPs require Business or Enterprise support.
-
+Account is on the free support tier, which limits the cost-specific checks (idle EC2, unassociated EIPs need Business/Enterprise support).
 ![Trusted Advisor](Assets/Screenshot%20from%202026-05-26%2015-57-01.png)
 
----
-
-#### Unattached EBS Volume in the console
-
-Volume `vol-04a67d91f5f0602a7` (`zombie-unattached-ebs`) is 10 GiB gp3, in `eu-west-1a`. **Volume state: Available** — not attached to any instance, accumulating storage charges with no workload benefit.
-
+#### Unattached EBS volume
+10 GiB gp3 in `eu-west-1a`, **state: Available** — accumulating storage charges with no workload.
 ![Unattached EBS Volume](Assets/Screenshot%20from%202026-05-26%2016-00-12.png)
 
----
-
-#### Unassociated Elastic IP in the console
-
-EIP `79.125.119.62` (allocation `eipalloc-07729e84729b501d0`) has no Association ID, no Associated Instance ID, and no Network Interface. AWS charges $0.005/hour for every idle EIP.
-
+#### Unassociated Elastic IP
+No Association ID, no instance, no ENI — AWS charges $0.005/hour for idle EIPs.
 ![Unassociated EIP](Assets/Screenshot%20from%202026-05-26%2016-04-30.png)
 
----
-
-#### Cost impact — after zombie resources ran
-
-After the zombie resources ran for approximately 37 hours, monthly spend jumped from **$0.03 to $1.57** — a 2,517% increase. The breakdown shows EC2 Compute ($0.98) as the dominant driver, followed by VPC/networking charges ($0.23) from the idle EIP and EC2-Other ($0.09) from the EBS volume.
-
+#### Cost impact — after the zombies ran
+After ~37 hours, monthly spend jumped from **$0.03 → $1.57** (a 2,517% increase). EC2 Compute ($0.98) dominates, then VPC/networking ($0.23) from the idle EIP and EC2-Other ($0.09) from the EBS volume.
 ![Cost after zombie resources](Assets/Screenshot%20from%202026-05-28%2011-00-33.png)
 
----
-
 #### Billing line-item breakdown
-
-The AWS Bills page confirms the exact charges: the `zombie-idle-ec2` t3.medium instance ran for **37 hours at $0.0456/hr = $1.69** (slightly offset by an EC2 Savings Plan discount of -$0.03). The unattached EBS volume contributed **$0.16** for 1.828 GB-months of gp3 storage.
-
+The t3.medium ran **37 hrs at $0.0456/hr = $1.69** (offset by a -$0.03 Savings Plan discount); the EBS volume added **$0.16** for 1.828 GB-months of gp3.
 ![Billing breakdown](Assets/Screenshot%20from%202026-05-28%2011-02-27.png)
 
----
+### Automated garbage collector (`modules/cleanup`)
 
-### Automated garbage collector
-
-The `cleanup/` module contains a Lambda function that automatically removes zombie resources on a weekly schedule. It evaluates the **entire account**, not just tagged resources.
-
-**What it deletes:**
+A Python 3.12 Lambda runs every Sunday at 23:59 UTC (EventBridge) and **sweeps every enabled region**.
 
 | Target | Detection logic | Action |
 |---|---|---|
 | EBS volumes | `state == available` | `DeleteVolume` |
 | Elastic IPs | `AssociationId` absent | `ReleaseAddress` |
-| EC2 instances | Avg CPU < 5% over 7 days (CloudWatch) | `TerminateInstances` |
+| EC2 instances | **tagged `Type=ZombieAsset`** AND age ≥ 7 days AND avg CPU < 5% over 7 days | `TerminateInstances` |
 
-**Schedule:** EventBridge — every Sunday at 23:59 UTC (`cron(59 23 ? * SUN *)`)
+**Safety design (defense in depth):**
+- Termination requires the `Type=ZombieAsset` tag — enforced **both** in the Lambda code *and* in its IAM policy (`ec2:TerminateInstances` is conditioned on `ec2:ResourceTag/Type = ZombieAsset`). A logic regression still cannot terminate an untagged production instance.
+- Instances younger than the 7-day lookback window are skipped — insufficient CloudWatch history to judge idleness fairly.
 
-**Safety guard:** Instances younger than 7 days are skipped — insufficient CloudWatch data to make a fair idle determination.
-
-**Deploy:**
+**Run on demand (don't wait for Sunday):**
 ```bash
-cd cleanup
-terraform init
-terraform apply
+aws lambda invoke --function-name zombie-garbage-collector \
+  --region eu-west-1 response.json && cat response.json
 ```
 
-**Run immediately without waiting for Sunday:**
-```bash
-aws lambda invoke \
-  --function-name zombie-garbage-collector \
-  --region eu-west-1 \
-  response.json && cat response.json
-```
+**Unit tests** for the detection logic live in `tests/` — see [Testing](#testing).
 
 ---
 
-## Part 2 — Governance
+## Part 2 — Governance (`modules/governance`)
 
 ### AWS Budget — $50/month with tiered alerts
 
-Configured in `governance-arch/main.tf`. All alerts route to SNS and direct email (`joel.ackah@amalitech.com`).
+Seven thresholds, all routed **through SNS only** (the SNS topic holds one confirmed email subscription, so each alert sends exactly one email — no duplicates).
 
 | Threshold | Type | Meaning |
 |---|---|---|
-| 50% ($25) | Actual | Halfway — monitor |
-| 70% ($35) | Actual | Approaching limit — review resources |
-| 80% ($40) | Actual | Action required |
-| 80% ($40) | Forecasted | AWS predicts a breach this month |
-| 90% ($45) | Actual | Critical — shut down non-production |
-| 100% ($50) | Actual | Budget breached |
-| 100% ($50) | Forecasted | Breach predicted before month end |
-
-> After `terraform apply`, confirm the SNS email subscription from your inbox. Alerts are not delivered until confirmed.
-
-#### Budget alerts configured in AWS Console
-
-All seven alert thresholds are active in the Budgets dashboard. The screenshot shows each notification defined with its threshold, type (actual vs forecasted), and threshold amount against the $50 budget.
+| 50% / 70% / 80% / 90% / 100% | Actual | Escalating spend warnings |
+| 80% / 100% | Forecasted | AWS predicts a breach this month |
 
 ![Budget alerts configured](Assets/Screenshot%20from%202026-05-28%2016-14-32.png)
 
----
+### CostCenter tagging policy — two enforcement layers
 
-### CostCenter tagging policy
-
-Every EC2 instance must carry a `CostCenter` tag for cost attribution. Two enforcement layers are in place.
-
----
-
-#### Detective layer — AWS Config `REQUIRED_TAGS`
-
-`aws_config_config_rule.require_costcenter_tag` continuously evaluates all EC2 instances. Any instance missing `CostCenter` is flagged **NON_COMPLIANT** in the Config dashboard within minutes of launch.
-
-**Where to view:** AWS Console → Config → Rules → `require-costcenter-tag-ec2`
-
-This rule **does not block** launches — it flags violations after the resource already exists.
-
-#### AWS Config — NON_COMPLIANT resources detected
-
-The Config Resource Inventory filtered to NON_COMPLIANT resources shows the zombie assets flagged: the unattached EBS volume, S3 bucket, and multiple EC2 instances (including `zombie-idle-ec2`) are all marked non-compliant because they lack the required `CostCenter` tag.
-
+**Detective — AWS Config `REQUIRED_TAGS`** (`require-costcenter-tag-ec2`): continuously flags any EC2 instance missing `CostCenter` as **NON_COMPLIANT**. Reactive — it does not block the launch.
 ![Config NON_COMPLIANT resources](Assets/Screenshot%20from%202026-05-28%2016-41-35.png)
 
----
+**Preventive — IAM Deny policy (SCP simulation):** `finops-deny-untagged-ec2`, attached to `finops-scp-test-user`, blocks `ec2:RunInstances` when `CostCenter` is absent or empty — the same `UnauthorizedOperation` a real Organizations SCP produces. The portable SCP JSON is at [`modules/governance/documentation/policies/scp-deny-untagged.json`](modules/governance/documentation/policies/scp-deny-untagged.json).
 
-#### Preventive layer — IAM Deny policy (SCP simulation)
+> **Access keys are not created by Terraform** (that would write the secret into state). Mint a short-lived key out-of-band for the deny tests, then delete it:
+> ```bash
+> aws iam create-access-key --user-name finops-scp-test-user
+> # ...run tests...
+> aws iam delete-access-key --user-name finops-scp-test-user --access-key-id <id>
+> ```
 
-`aws_iam_policy.deny_untagged_ec2` is attached to `finops-scp-test-user` and blocks `ec2:RunInstances` when `CostCenter` is absent or empty. This produces the same `UnauthorizedOperation` API denial that a real AWS Organizations SCP would — without requiring an AWS Organization.
+#### Tagging-policy test cases
 
-The actual SCP JSON is at `governance-arch/documentation/policies/scp-deny-untagged.json` for use when the account is part of an Organization.
+| Test | Tags | Result |
+|---|---|---|
+| 1 | none | **DENIED** ([screenshot](Assets/Screenshot%20from%202026-05-29%2010-43-47.png)) |
+| 2 | `CostCenter=` (empty) | **DENIED** ([screenshot](Assets/Screenshot%20from%202026-05-29%2010-46-12.png)) |
+| 3 | `CostCenter=FinOps` | **ALLOWED** ([screenshot](Assets/Screenshot%20from%202026-05-29%2010-49-05.png)) |
 
-#### IAM test user configured with both policies
+![IAM test user with both policies](Assets/Screenshot%20from%202026-05-29%2010-22-17.png)
 
-The `finops-scp-test-user` IAM user is created with two policies attached directly:
-- `AmazonEC2FullAccess` (AWS managed) — allows the user to attempt EC2 operations
-- `finops-deny-untagged-ec2` (Customer managed) — denies `RunInstances` when `CostCenter` is missing or empty
-
-The access key is active and was used for all CLI tests below.
-
-![finops-scp-test-user IAM user](Assets/Screenshot%20from%202026-05-29%2010-22-17.png)
-
----
-
-#### Test 1 — Launch without tags → DENIED
-
-Attempting to launch an EC2 instance through the console without providing a `CostCenter` tag results in an immediate **"Instance launch failed"** error. The launch log shows the request was received and immediately rejected with an encoded `UnauthorizedOperation` authorization failure message.
-
-![Launch failed — no tags](Assets/Screenshot%20from%202026-05-29%2010-43-47.png)
+Full policy breakdown, attachment guidance, and break-glass procedures: [`modules/governance/documentation/policies/tagging-policy.md`](modules/governance/documentation/policies/tagging-policy.md).
 
 ---
 
-#### Test 2 — Launch with invalid/empty CostCenter → DENIED
+## Part 3 — Optimization Architecture (`modules/optimize`)
 
-A second attempt to launch — this time with a `CostCenter` tag provided but with an empty or insufficient value — is also blocked. The same `UnauthorizedOperation` error banner appears, confirming that the deny policy catches both the null-tag and empty-string cases.
+### Mixed-Instances Auto Scaling Group
 
-![Launch failed — empty CostCenter](Assets/Screenshot%20from%202026-05-29%2010-46-12.png)
+A guaranteed On-Demand base plus Spot for all scale-out, targeting stateless, interruption-tolerant workloads.
 
----
-
-#### Test 3 — Launch with valid CostCenter → ALLOWED
-
-Providing a valid `CostCenter` value (`FinOps`) allows the instance to launch successfully. The EC2 Instances list confirms the new instance (`i-091df5047bf633e9e`, named `NoTag`) is initializing alongside the existing `zombie-idle-ec2`. The Tags tab for the new instance shows `CostCenter=FinOps` — the policy allowed the request because the required tag was present with a non-empty value.
-
-![Launch succeeded — valid CostCenter](Assets/Screenshot%20from%202026-05-29%2010-49-05.png)
-
-![Launch succeeded — valid CostCenter](Assets/Screenshot%20from%202026-05-29%2010-51-31.png)
-
----
-
-**Deploy governance:**
-```bash
-cd governance-arch
-terraform init
-terraform apply
-
-# Retrieve test user credentials
-terraform output scp_test_user_access_key_id
-terraform output -raw scp_test_user_secret_access_key
-```
-
----
-
-## Part 3 — Optimization Architecture
-
-### Auto Scaling Group with Mixed Instances Policy
-
-Deployed in `optimize-arch/`. Combines a guaranteed On-Demand base with Spot Instances for all additional capacity, targeting stateless, interruption-tolerant workloads.
-
-**Instance composition (desired capacity = 3):**
-
-| Role | Instance type | Purchase type | Always running |
+| Role | Instance type | Purchase | Notes |
 |---|---|---|---|
-| Base | t3.medium | On-Demand | Yes — guaranteed |
-| Scale-out | t3.large | Spot | Up to 4 additional |
-| Scale-out fallback | t3a.large | Spot | Up to 4 additional |
+| Base | t3.medium | On-Demand | 1 always running |
+| Scale-out | t3.large | Spot | capacity-optimized |
+| Scale-out fallback | t3a.large | Spot | second pool for availability |
 
-**Cost comparison (eu-west-1, approximate):**
+**Cost comparison (eu-west-1, 3 instances 24/7):** 3× t3.medium On-Demand ≈ **$90/mo** vs 1× On-Demand + 2× Spot ≈ **$50/mo** → **~44% saving**.
 
-| Configuration | Monthly cost (3 instances, 24/7) |
-|---|---|
-| 3x t3.medium On-Demand | ~$90 |
-| 1x t3.medium On-Demand + 2x t3.large Spot | ~$50 |
-| Saving | ~44% |
-
-**Auto-scaling triggers:**
-
-| Alarm | Condition | Action | Cooldown |
-|---|---|---|---|
-| `finops-asg-high-cpu` | Avg CPU > 70% for 2 min | +1 instance | 120s |
-| `finops-asg-low-cpu` | Avg CPU < 20% for 3 min | −1 instance | 300s |
-
----
-
-#### ASG created and active in AWS Console
-
-The `finops-mixed-instances-asg` Auto Scaling Group is live in `eu-west-1`. The Capacity overview confirms the desired, minimum, and maximum capacity settings. The Details tab shows the associated Launch Template and the AZ distribution across `eu-west-1a`, `eu-west-1b`, and `eu-west-1c`.
+**Auto-scaling:** scale out at avg CPU > 70% (2 min); scale in at avg CPU < 20% (3 min, longer cooldown to avoid thrashing). Capacity rebalancing replaces Spot instances before reclamation.
 
 ![ASG created](Assets/Screenshot%20from%202026-05-29%2010-51-31.png)
-
----
-
-#### Mixed Instances Policy — instance types and purchase options
-
-The ASG Instance type requirements section confirms all three instance types are registered: `t3.medium` (2 vCPUs, 4 GiB), `t3.large` (2 vCPUs, 8 GiB), and `t3a.large` (2 vCPUs, 8 GiB). The Instance purchase options section shows the On-Demand base capacity alongside the Spot allocation strategy set to **capacity-optimized** — AWS selects the Spot pool with the most available capacity, minimising interruption rate.
-
 ![ASG instance types and purchase options](Assets/Screenshot%20from%202026-05-29%2014-42-48.png)
-
----
-
-#### ASG allocation strategies confirmed
-
-The allocation strategies section confirms:
-- **On-Demand allocation strategy** is configured for the base capacity
-- **Spot allocation strategy: capacity-optimized** — maximises availability from the highest-capacity Spot pool
-- **Capacity rebalance** is enabled — the ASG proactively replaces Spot instances that receive an interruption notice before they are reclaimed
-
 ![ASG allocation strategies](Assets/Screenshot%20from%202026-05-29%2014-42-58.png)
 
----
-
-**Deploy:**
+**Verify the live On-Demand vs Spot mix** (query EC2 directly — `InstanceLifecycle` is `spot` for Spot and absent/`None` for On-Demand):
 ```bash
-cd optimize-arch
-terraform init
-terraform apply
-```
-
-**Verify instance mix after deployment:**
-```bash
-aws autoscaling describe-auto-scaling-groups \
-  --auto-scaling-group-names finops-mixed-instances-asg \
-  --region eu-west-1 \
-  --query 'AutoScalingGroups[0].Instances[*].{ID:InstanceId,Type:InstanceType,Market:InstancePurchaseOption}' \
+aws ec2 describe-instances --region eu-west-1 \
+  --filters Name=tag:aws:autoscaling:groupName,Values=finops-mixed-instances-asg \
+            Name=instance-state-name,Values=running \
+  --query 'Reservations[].Instances[].{ID:InstanceId,Type:InstanceType,Lifecycle:InstanceLifecycle,AZ:Placement.AvailabilityZone}' \
   --output table
 ```
 
-For the full end-to-end cost optimization guide see [`optimize-arch/documentation/cost-optimization-guide.md`](optimize-arch/documentation/cost-optimization-guide.md).
+Expected: one instance with `Lifecycle: None` (the On-Demand base) and two with `Lifecycle: spot`.
+
+End-to-end guide: [`modules/optimize/documentation/cost-optimization-guide.md`](modules/optimize/documentation/cost-optimization-guide.md).
 
 ---
 
-## Deployment Order
+## Testing
 
-Each module is an independent Terraform root. Deploy in this order:
-
-```bash
-# 1. Zombie resources (the problem)
-cd zombie-arch && terraform init && terraform apply
-
-# 2. Governance (budget + tagging enforcement)
-cd ../governance-arch && terraform init && terraform apply
-
-# 3. Automated cleanup (the solution to Part 1)
-cd ../cleanup && terraform init && terraform apply
-
-# 4. Optimized architecture
-cd ../optimize-arch && terraform init && terraform apply
-```
-
-## Tear Down
+Logic in the garbage collector (idle detection, age guard, tag gate, multi-region discovery) is covered by `pytest` unit tests using mocked boto3 clients — no AWS calls, no credentials.
 
 ```bash
-for dir in optimize-arch cleanup governance-arch zombie-arch; do
-  cd /path/to/FinOps/$dir && terraform destroy -auto-approve
-done
+python3 -m venv .venv && source .venv/bin/activate
+pip install -r tests/requirements.txt
+pytest -v
 ```
+
+The same suite plus `terraform fmt -check` and `terraform validate` run on every push/PR via [`.github/workflows/ci.yml`](.github/workflows/ci.yml).
+
+---
+
+## How the first-round feedback was addressed
+
+| Review gap | Fix |
+|---|---|
+| No remote backend; 4 local state files | Single S3 backend (`backend.tf`) with native lockfile; bootstrap script |
+| 4 separate root modules | One root composing 4 child modules under `modules/` |
+| Lambda `TerminateInstances` on `Resource="*"` | Conditioned on `ec2:ResourceTag/Type=ZombieAsset` (IAM **and** code) |
+| Duplicate budget emails (SNS + direct) | Removed `subscriber_email_addresses`; SNS-only delivery |
+| Access key secret in state | `aws_iam_access_key` removed; keys minted out-of-band |
+| Single-region garbage collector | Iterates all enabled regions via `describe_regions` |
+| `*.zip` committed | `.gitignore`d and removed (`archive_file` regenerates it) |
+| Testing 2/5 | pytest unit suite + GitHub Actions CI |
 
 ---
 
 ## Requirements
 
-- Terraform >= 1.3.0
-- AWS provider 6.25.0
-- AWS CLI configured with sufficient IAM permissions (EC2, Lambda, Budgets, Config, SNS, CloudWatch, IAM)
-- Python 3.12 (Lambda runtime — no local dependency required)
+- Terraform >= 1.6.0, AWS provider 6.25.0
+- AWS CLI configured (`AWS_PROFILE=NSPAccount`) with EC2, Lambda, Budgets, Config, SNS, CloudWatch, IAM, S3 permissions
+- Python 3.12 (Lambda runtime; boto3 + pytest only needed locally to run tests)

@@ -2,14 +2,9 @@ terraform {
   required_providers {
     aws = {
       source  = "hashicorp/aws"
-      version = "6.25.0"
+      version = ">= 6.0"
     }
   }
-  required_version = ">= 1.3.0"
-}
-
-provider "aws" {
-  region = var.region
 }
 
 data "aws_ami" "amazon_linux" {
@@ -27,7 +22,9 @@ data "aws_ami" "amazon_linux" {
   }
 }
 
-# Idle EC2 instance — t3.medium with no meaningful workload
+# Idle EC2 instance — t3.medium with no meaningful workload.
+# Tagged Type=ZombieAsset so the garbage collector is permitted to reap it
+# (the cleanup Lambda's terminate permission is scoped to this exact tag).
 resource "aws_instance" "idle_ec2" {
   ami           = data.aws_ami.amazon_linux.id
   instance_type = "t3.medium"

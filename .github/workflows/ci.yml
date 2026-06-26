@@ -1,0 +1,42 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  terraform:
+    name: Terraform fmt + validate
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: hashicorp/setup-terraform@v3
+        with:
+          terraform_version: "1.6.0"
+
+      - name: terraform fmt
+        run: terraform fmt -check -recursive
+
+      # validate runs without a backend or credentials
+      - name: terraform validate
+        run: |
+          terraform init -backend=false
+          terraform validate
+
+  python:
+    name: Lambda unit tests
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install test deps
+        run: pip install -r tests/requirements.txt
+
+      - name: pytest
+        run: pytest -v

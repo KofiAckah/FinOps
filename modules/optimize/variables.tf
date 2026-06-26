@@ -1,9 +1,3 @@
-variable "region" {
-  description = "AWS region"
-  type        = string
-  default     = "eu-west-1"
-}
-
 variable "asg_min_size" {
   description = "Minimum number of instances in the ASG"
   type        = number

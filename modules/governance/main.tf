@@ -2,14 +2,9 @@ terraform {
   required_providers {
     aws = {
       source  = "hashicorp/aws"
-      version = "6.25.0"
+      version = ">= 6.0"
     }
   }
-  required_version = ">= 1.3.0"
-}
-
-provider "aws" {
-  region = var.region
 }
 
 data "aws_caller_identity" "current" {}
@@ -50,6 +45,22 @@ resource "aws_sns_topic_policy" "budget_alerts" {
 }
 
 # ─── AWS Budget ($50/month) ───────────────────────────────────────────────────
+#
+# Every notification routes through SNS only. The SNS topic has a single
+# confirmed email subscription, so each threshold delivers exactly one email.
+# (Adding subscriber_email_addresses here as well would double every alert.)
+
+locals {
+  budget_thresholds = [
+    { threshold = 50, type = "ACTUAL" },
+    { threshold = 70, type = "ACTUAL" },
+    { threshold = 80, type = "ACTUAL" },
+    { threshold = 90, type = "ACTUAL" },
+    { threshold = 100, type = "ACTUAL" },
+    { threshold = 80, type = "FORECASTED" },
+    { threshold = 100, type = "FORECASTED" },
+  ]
+}
 
 resource "aws_budgets_budget" "monthly_cost" {
   name         = "finops-monthly-50-usd"
@@ -58,71 +69,15 @@ resource "aws_budgets_budget" "monthly_cost" {
   limit_unit   = "USD"
   time_unit    = "MONTHLY"
 
-  # ── Actual cost alerts ────────────────────────────────────────────────────
-
-  notification {
-    comparison_operator       = "GREATER_THAN"
-    threshold                 = 50
-    threshold_type            = "PERCENTAGE"
-    notification_type         = "ACTUAL"
-    subscriber_sns_topic_arns = [aws_sns_topic.budget_alerts.arn]
-    subscriber_email_addresses = [var.alert_email]
-  }
-
-  notification {
-    comparison_operator       = "GREATER_THAN"
-    threshold                 = 70
-    threshold_type            = "PERCENTAGE"
-    notification_type         = "ACTUAL"
-    subscriber_sns_topic_arns = [aws_sns_topic.budget_alerts.arn]
-    subscriber_email_addresses = [var.alert_email]
-  }
-
-  notification {
-    comparison_operator       = "GREATER_THAN"
-    threshold                 = 80
-    threshold_type            = "PERCENTAGE"
-    notification_type         = "ACTUAL"
-    subscriber_sns_topic_arns = [aws_sns_topic.budget_alerts.arn]
-    subscriber_email_addresses = [var.alert_email]
-  }
-
-  notification {
-    comparison_operator       = "GREATER_THAN"
-    threshold                 = 90
-    threshold_type            = "PERCENTAGE"
-    notification_type         = "ACTUAL"
-    subscriber_sns_topic_arns = [aws_sns_topic.budget_alerts.arn]
-    subscriber_email_addresses = [var.alert_email]
-  }
-
-  notification {
-    comparison_operator       = "GREATER_THAN"
-    threshold                 = 100
-    threshold_type            = "PERCENTAGE"
-    notification_type         = "ACTUAL"
-    subscriber_sns_topic_arns = [aws_sns_topic.budget_alerts.arn]
-    subscriber_email_addresses = [var.alert_email]
-  }
-
-  # ── Forecasted cost alerts ────────────────────────────────────────────────
-
-  notification {
-    comparison_operator       = "GREATER_THAN"
-    threshold                 = 80
-    threshold_type            = "PERCENTAGE"
-    notification_type         = "FORECASTED"
-    subscriber_sns_topic_arns = [aws_sns_topic.budget_alerts.arn]
-    subscriber_email_addresses = [var.alert_email]
-  }
-
-  notification {
-    comparison_operator       = "GREATER_THAN"
-    threshold                 = 100
-    threshold_type            = "PERCENTAGE"
-    notification_type         = "FORECASTED"
-    subscriber_sns_topic_arns = [aws_sns_topic.budget_alerts.arn]
-    subscriber_email_addresses = [var.alert_email]
+  dynamic "notification" {
+    for_each = local.budget_thresholds
+    content {
+      comparison_operator       = "GREATER_THAN"
+      threshold                 = notification.value.threshold
+      threshold_type            = "PERCENTAGE"
+      notification_type         = notification.value.type
+      subscriber_sns_topic_arns = [aws_sns_topic.budget_alerts.arn]
+    }
   }
 }
 
@@ -145,11 +100,11 @@ resource "aws_s3_bucket_policy" "config_logs" {
     Version = "2012-10-17"
     Statement = [
       {
-        Sid    = "AWSConfigBucketPermissionsCheck"
-        Effect = "Allow"
+        Sid       = "AWSConfigBucketPermissionsCheck"
+        Effect    = "Allow"
         Principal = { Service = "config.amazonaws.com" }
-        Action   = "s3:GetBucketAcl"
-        Resource = aws_s3_bucket.config_logs.arn
+        Action    = "s3:GetBucketAcl"
+        Resource  = aws_s3_bucket.config_logs.arn
         Condition = {
           StringEquals = {
             "aws:SourceAccount" = data.aws_caller_identity.current.account_id
@@ -157,14 +112,14 @@ resource "aws_s3_bucket_policy" "config_logs" {
         }
       },
       {
-        Sid    = "AWSConfigBucketDelivery"
-        Effect = "Allow"
+        Sid       = "AWSConfigBucketDelivery"
+        Effect    = "Allow"
         Principal = { Service = "config.amazonaws.com" }
-        Action   = "s3:PutObject"
-        Resource = "${aws_s3_bucket.config_logs.arn}/AWSLogs/${data.aws_caller_identity.current.account_id}/Config/*"
+        Action    = "s3:PutObject"
+        Resource  = "${aws_s3_bucket.config_logs.arn}/AWSLogs/${data.aws_caller_identity.current.account_id}/Config/*"
         Condition = {
           StringEquals = {
-            "s3:x-amz-acl"     = "bucket-owner-full-control"
+            "s3:x-amz-acl"      = "bucket-owner-full-control"
             "aws:SourceAccount" = data.aws_caller_identity.current.account_id
           }
         }
@@ -220,6 +175,10 @@ resource "aws_config_configuration_recorder_status" "main" {
 # Mirrors the SCP in documentation/policies/scp-deny-untagged.json using an
 # IAM Deny policy, which produces the same UnauthorizedOperation error without
 # needing AWS Organizations.
+#
+# NOTE: No aws_iam_access_key is created here on purpose — that would write the
+# secret access key into Terraform state in plaintext. Generate a short-lived
+# key for testing out-of-band and delete it afterwards (see module outputs).
 
 resource "aws_iam_user" "scp_test_user" {
   name = "finops-scp-test-user"
@@ -228,10 +187,6 @@ resource "aws_iam_user" "scp_test_user" {
     Name    = "finops-scp-test-user"
     Purpose = "SCP simulation testing"
   }
-}
-
-resource "aws_iam_access_key" "scp_test_user" {
-  user = aws_iam_user.scp_test_user.name
 }
 
 # Allow the test user to attempt EC2 launches (so the deny is what stops them)
@@ -248,9 +203,9 @@ resource "aws_iam_policy" "deny_untagged_ec2" {
     Version = "2012-10-17"
     Statement = [
       {
-        Sid    = "DenyRunInstancesMissingCostCenter"
-        Effect = "Deny"
-        Action = "ec2:RunInstances"
+        Sid      = "DenyRunInstancesMissingCostCenter"
+        Effect   = "Deny"
+        Action   = "ec2:RunInstances"
         Resource = "arn:aws:ec2:*:*:instance/*"
         Condition = {
           Null = {
@@ -259,9 +214,9 @@ resource "aws_iam_policy" "deny_untagged_ec2" {
         }
       },
       {
-        Sid    = "DenyRunInstancesEmptyCostCenter"
-        Effect = "Deny"
-        Action = "ec2:RunInstances"
+        Sid      = "DenyRunInstancesEmptyCostCenter"
+        Effect   = "Deny"
+        Action   = "ec2:RunInstances"
         Resource = "arn:aws:ec2:*:*:instance/*"
         Condition = {
           StringEquals = {
