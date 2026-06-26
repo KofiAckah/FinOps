@@ -234,6 +234,6 @@ The same suite plus `terraform fmt -check` and `terraform validate` run on every
 
 ## Requirements
 
-- Terraform >= 1.6.0, AWS provider 6.25.0
+- Terraform >= 1.11.0 (S3 backend native locking), AWS provider 6.25.0
 - AWS CLI configured (`AWS_PROFILE=NSPAccount`) with EC2, Lambda, Budgets, Config, SNS, CloudWatch, IAM, S3 permissions
 - Python 3.12 (Lambda runtime; boto3 + pytest only needed locally to run tests)

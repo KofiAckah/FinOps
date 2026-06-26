@@ -14,7 +14,10 @@ jobs:
 
       - uses: hashicorp/setup-terraform@v3
         with:
-          terraform_version: "1.6.0"
+          # Must be >= 1.11 — older versions reject the S3 backend's
+          # use_lockfile arg and can't verify HashiCorp's current provider
+          # signing key (the "error checking signature" failure).
+          terraform_version: "1.15.7"
 
       - name: terraform fmt
         run: terraform fmt -check -recursive
