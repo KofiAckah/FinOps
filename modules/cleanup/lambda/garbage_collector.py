@@ -23,11 +23,16 @@ import os
 from datetime import datetime, timedelta, timezone
 
 import boto3
+from botocore.config import Config
 
 CPU_IDLE_THRESHOLD = float(os.environ.get("CPU_IDLE_THRESHOLD", "5.0"))
 IDLE_LOOKBACK_DAYS = int(os.environ.get("IDLE_LOOKBACK_DAYS", "7"))
 ZOMBIE_TAG_KEY = os.environ.get("ZOMBIE_TAG_KEY", "Type")
 ZOMBIE_TAG_VALUE = os.environ.get("ZOMBIE_TAG_VALUE", "ZombieAsset")
+
+# Explicit timeouts so a slow region can never hang the whole Lambda invocation.
+# (Config has no region/credential dependency, so it's safe to build at import.)
+BOTO_CONFIG = Config(connect_timeout=10, read_timeout=30, retries={"max_attempts": 3})
 
 
 def list_enabled_regions(ec2_client):
@@ -101,50 +106,61 @@ def release_unassociated_eips(ec2_client, region):
     return released
 
 
-def terminate_idle_zombie_instances(ec2_client, cloudwatch, region, now=None):
-    now = now or datetime.now(timezone.utc)
-    terminated = []
-    skipped = []
-
+def _iter_running_instances(ec2_client):
     paginator = ec2_client.get_paginator("describe_instances")
     for page in paginator.paginate(
         Filters=[{"Name": "instance-state-name", "Values": ["running"]}]
     ):
         for reservation in page["Reservations"]:
-            for instance in reservation["Instances"]:
-                instance_id = instance["InstanceId"]
+            yield from reservation["Instances"]
 
-                # Gate 1 — only ever touch instances tagged as disposable.
-                if not is_zombie_tagged(instance):
-                    skipped.append({"region": region, "instance_id": instance_id, "reason": "not_zombie_tagged"})
-                    continue
 
-                # Gate 2 — skip instances younger than the lookback window.
-                age_days = instance_age_days(instance["LaunchTime"], now=now)
-                if age_days < IDLE_LOOKBACK_DAYS:
-                    skipped.append({"region": region, "instance_id": instance_id, "reason": "too_young", "age_days": age_days})
-                    print(f"[{region}] Skipping {instance_id} — only {age_days} day(s) old")
-                    continue
+def evaluate_instance(instance, cloudwatch, region, now):
+    """Apply the three termination gates. Returns (terminate?, outcome_record)."""
+    instance_id = instance["InstanceId"]
+    base = {"region": region, "instance_id": instance_id}
 
-                # Gate 3 — must be idle. No datapoints after the window also reads as idle.
-                avg_cpu = get_instance_avg_cpu(cloudwatch, instance_id, now=now)
-                if avg_cpu is None or avg_cpu < CPU_IDLE_THRESHOLD:
-                    try:
-                        ec2_client.terminate_instances(InstanceIds=[instance_id])
-                        terminated.append({"region": region, "instance_id": instance_id, "avg_cpu_percent": avg_cpu, "age_days": age_days})
-                        print(f"[{region}] Terminated idle zombie instance {instance_id} (avg CPU: {avg_cpu}%)")
-                    except Exception as e:
-                        print(f"[{region}] Failed to terminate {instance_id}: {e}")
-                else:
-                    skipped.append({"region": region, "instance_id": instance_id, "reason": "active", "avg_cpu_percent": avg_cpu})
+    # Gate 1 — only ever touch instances tagged as disposable.
+    if not is_zombie_tagged(instance):
+        return False, {**base, "reason": "not_zombie_tagged"}
+
+    # Gate 2 — skip instances younger than the lookback window.
+    age_days = instance_age_days(instance["LaunchTime"], now=now)
+    if age_days < IDLE_LOOKBACK_DAYS:
+        return False, {**base, "reason": "too_young", "age_days": age_days}
+
+    # Gate 3 — must be idle. No datapoints after the window also reads as idle.
+    avg_cpu = get_instance_avg_cpu(cloudwatch, instance_id, now=now)
+    if avg_cpu is None or avg_cpu < CPU_IDLE_THRESHOLD:
+        return True, {**base, "avg_cpu_percent": avg_cpu, "age_days": age_days}
+    return False, {**base, "reason": "active", "avg_cpu_percent": avg_cpu}
+
+
+def terminate_idle_zombie_instances(ec2_client, cloudwatch, region, now=None):
+    now = now or datetime.now(timezone.utc)
+    terminated = []
+    skipped = []
+
+    for instance in _iter_running_instances(ec2_client):
+        should_terminate, record = evaluate_instance(instance, cloudwatch, region, now)
+        if not should_terminate:
+            skipped.append(record)
+            continue
+        try:
+            ec2_client.terminate_instances(InstanceIds=[record["instance_id"]])
+            terminated.append(record)
+            print(f"[{region}] Terminated idle zombie instance {record['instance_id']} (avg CPU: {record['avg_cpu_percent']}%)")
+        except Exception as e:
+            print(f"[{region}] Failed to terminate {record['instance_id']}: {e}")
+            skipped.append({**record, "reason": "terminate_failed", "error": str(e)})
 
     return {"terminated": terminated, "skipped": skipped}
 
 
 def collect_region(region, now=None):
     """Run all three sweeps in a single region."""
-    ec2_client = boto3.client("ec2", region_name=region)
-    cloudwatch = boto3.client("cloudwatch", region_name=region)
+    ec2_client = boto3.client("ec2", region_name=region, config=BOTO_CONFIG)
+    cloudwatch = boto3.client("cloudwatch", region_name=region, config=BOTO_CONFIG)
     return {
         "deleted_ebs_volumes": delete_unattached_ebs_volumes(ec2_client, region),
         "released_eips": release_unassociated_eips(ec2_client, region),
@@ -156,7 +172,7 @@ def lambda_handler(event, context):
     print("Starting multi-region zombie resource garbage collection...")
     now = datetime.now(timezone.utc)
 
-    bootstrap = boto3.client("ec2")
+    bootstrap = boto3.client("ec2", config=BOTO_CONFIG)
     regions = list_enabled_regions(bootstrap)
     print(f"Scanning {len(regions)} region(s): {', '.join(regions)}")
 
@@ -165,8 +181,15 @@ def lambda_handler(event, context):
         try:
             report["regions"][region] = collect_region(region, now=now)
         except Exception as e:
-            print(f"[{region}] Region sweep failed: {e}")
-            report["regions"][region] = {"error": str(e)}
+            msg = str(e)
+            # Org SCPs / disabled regions deny EC2 calls — that's expected, not a
+            # failure. Record it concisely instead of dumping the raw error blob.
+            if any(code in msg for code in ("UnauthorizedOperation", "AccessDenied", "AuthFailure")):
+                print(f"[{region}] Skipped — no access (SCP or region disabled)")
+                report["regions"][region] = {"skipped": "no_access_scp_or_disabled"}
+            else:
+                print(f"[{region}] Region sweep failed: {e}")
+                report["regions"][region] = {"error": msg}
 
     print("Garbage collection complete.")
     print(json.dumps(report, indent=2, default=str))

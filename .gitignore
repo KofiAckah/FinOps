@@ -97,3 +97,5 @@ Thumbs.db
 ansible.log
 review.md
 review.txt
+# Lambda invoke output
+response.json
